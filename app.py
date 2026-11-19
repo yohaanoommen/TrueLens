@@ -2,7 +2,7 @@
 
 The UI allows the user to upload one or more files, optionally provide a caption,
 and runs the TruthLens analysis pipeline.
-Displays findings, limitations, and evidence images.
+Displays findings, limitations, visual evidence, and provides JSON/HTML report downloads.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ from typing import List
 import streamlit as st
 
 from truthlens.pipeline import run_case
+from truthlens.report.generator import generate_html_report
 from truthlens.schemas import Finding, Report
 
 st.set_page_config(page_title="TruthLens – Digital Forensics", layout="centered")
@@ -57,6 +58,10 @@ if st.button("Analyze"):
         st.markdown(f"**Confidence Level:** `{report.overall.level.upper()}`")
         st.markdown(f"**Summary:** {report.overall.summary}")
         st.markdown(f"**Reasoning:** {report.overall.reasoning}")
+        if report.overall.caveats:
+            st.markdown("**Caveats:**")
+            for caveat in report.overall.caveats:
+                st.markdown(f"- *{caveat}*")
 
         # Display findings.
         st.subheader("Findings")
@@ -91,11 +96,31 @@ if st.button("Analyze"):
         else:
             st.info("No findings were generated.")
 
-        # Provide JSON download.
-        json_str = report.model_dump_json(indent=2)
-        st.download_button(
-            label="Download report JSON",
-            data=json_str,
-            file_name=f"{report.case_id}_report.json",
-            mime="application/json",
-        )
+        # Display recommended human checks
+        if report.recommended_human_checks:
+            st.subheader("Recommended Human Checks")
+            for check in report.recommended_human_checks:
+                st.markdown(f"- {check}")
+
+        # Provide JSON and HTML downloads.
+        col1, col2 = st.columns(2)
+        with col1:
+            json_str = report.model_dump_json(indent=2)
+            st.download_button(
+                label="Download Report JSON",
+                data=json_str,
+                file_name=f"{report.case_id}_report.json",
+                mime="application/json",
+            )
+        with col2:
+            html_path = case_dir / "report.html"
+            if html_path.exists():
+                html_content = html_path.read_text(encoding="utf-8")
+            else:
+                html_content = generate_html_report(report, case_dir)
+            st.download_button(
+                label="Download Report HTML",
+                data=html_content,
+                file_name=f"{report.case_id}_report.html",
+                mime="text/html",
+            )

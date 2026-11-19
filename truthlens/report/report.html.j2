@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>TruthLens Forensic Report - {{ report.case_id }}</title>
+  <style>
+    :root {
+      --bg: #f8fafc;
+      --card-bg: #ffffff;
+      --text: #0f172a;
+      --text-muted: #475569;
+      --border: #e2e8f0;
+      --danger: #ef4444;
+      --warning: #f59e0b;
+      --success: #10b981;
+      --info: #3b82f6;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background-color: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      margin: 0;
+      padding: 24px;
+    }
+    .container {
+      max-width: 960px;
+      margin: 0 auto;
+    }
+    .banner-stub {
+      background: #fef3c7;
+      border: 1px solid #f59e0b;
+      color: #92400e;
+      padding: 12px 16px;
+      border-radius: 8px;
+      font-weight: 600;
+      margin-bottom: 24px;
+    }
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 20px;
+      margin-bottom: 24px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    }
+    h1, h2, h3 {
+      margin-top: 0;
+      color: #1e293b;
+    }
+    h1 { font-size: 24px; border-bottom: 2px solid var(--border); padding-bottom: 12px; }
+    h2 { font-size: 18px; margin-bottom: 14px; border-bottom: 1px solid var(--border); padding-bottom: 8px; }
+    .badge {
+      display: inline-block;
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .badge-high { background: #fee2e2; color: #b91c1c; }
+    .badge-medium { background: #fef3c7; color: #b45309; }
+    .badge-low { background: #dbeafe; color: #1d4ed8; }
+    .badge-inconclusive { background: #f1f5f9; color: #475569; }
+    .badge-flagged { background: #fee2e2; color: #b91c1c; }
+    .badge-clear { background: #dcfce7; color: #15803d; }
+    .badge-unavailable { background: #f1f5f9; color: #64748b; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 8px;
+    }
+    th, td {
+      text-align: left;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+      font-size: 14px;
+    }
+    th {
+      background: #f8fafc;
+      font-weight: 600;
+      color: #334155;
+    }
+    .image-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 16px;
+      margin-top: 12px;
+    }
+    .image-card {
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px;
+      background: #fafafa;
+    }
+    .image-card img {
+      width: 100%;
+      height: auto;
+      border-radius: 4px;
+      display: block;
+    }
+    .image-card .caption {
+      font-size: 12px;
+      color: var(--text-muted);
+      margin-top: 6px;
+      text-align: center;
+    }
+    .finding-block {
+      border-left: 4px solid var(--border);
+      padding-left: 12px;
+      margin-bottom: 16px;
+    }
+    .finding-block.flagged { border-color: var(--danger); }
+    .finding-block.clear { border-color: var(--success); }
+    .finding-block.unavailable { border-color: #94a3b8; }
+    ul { margin: 8px 0; padding-left: 20px; }
+    li { margin-bottom: 4px; font-size: 14px; }
+    .footer {
+      text-align: center;
+      font-size: 13px;
+      color: #64748b;
+      padding: 20px 0;
+      border-top: 1px solid var(--border);
+      margin-top: 32px;
+    }
+    code {
+      font-family: monospace;
+      background: #f1f5f9;
+      padding: 2px 4px;
+      border-radius: 3px;
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+<div class="container">
+
+  {% if has_stubs %}
+  <div class="banner-stub">
+    Demo mode: these are placeholder findings, not real analysis.
+  </div>
+  {% endif %}
+
+  <!-- Section 1: Case Header -->
+  <div class="card">
+    <h1>TruthLens Forensic Report</h1>
+    <p><strong>Case ID:</strong> <code>{{ report.case_id }}</code> | <strong>Date:</strong> {{ report.created_at }}</p>
+    {% if report.context.caption %}
+    <p><strong>Claim / Context:</strong> "{{ report.context.caption }}"</p>
+    {% endif %}
+    <h3>Input Evidence</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>File ID</th>
+          <th>Filename</th>
+          <th>Media Type</th>
+          <th>SHA-256</th>
+          <th>Size</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for inp in report.inputs %}
+        <tr>
+          <td><code>{{ inp.file_id }}</code></td>
+          <td><strong>{{ inp.filename }}</strong></td>
+          <td>{{ inp.media_type }}</td>
+          <td><code title="{{ inp.sha256 }}">{{ inp.sha256[:16] }}...{{ inp.sha256[-8:] }}</code></td>
+          <td>{{ inp.size_bytes }} B</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Section 2: Overall Assessment -->
+  <div class="card">
+    <h2>2. Overall Assessment</h2>
+    <p>
+      <strong>Confidence Level:</strong>
+      <span class="badge badge-{{ report.overall.level }}">{{ report.overall.level }}</span>
+    </p>
+    <p><strong>Summary:</strong> {{ report.overall.summary }}</p>
+    <p><strong>Reasoning:</strong> {{ report.overall.reasoning }}</p>
+    {% if report.overall.caveats %}
+    <p><strong>Caveats:</strong></p>
+    <ul>
+      {% for caveat in report.overall.caveats %}
+      <li>{{ caveat }}</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  </div>
+
+  <!-- Section 3: Flagged Evidence Table -->
+  <div class="card">
+    <h2>3. Flagged Evidence Table</h2>
+    {% set flagged_findings = report.findings | selectattr("status", "equalto", "flagged") | list %}
+    {% if flagged_findings %}
+    <table>
+      <thead>
+        <tr>
+          <th>Source SHA-256</th>
+          <th>Modality</th>
+          <th>Analyzer</th>
+          <th>Location</th>
+          <th>Indicator</th>
+          <th>Confidence</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for f in flagged_findings %}
+        <tr>
+          <td><code title="{{ f.source_file_sha256 }}">{{ f.source_file_sha256[:12] }}...</code></td>
+          <td>{{ f.modality }}</td>
+          <td><code>{{ f.analyzer }}</code></td>
+          <td>
+            {% if f.location.type == "region" and f.location.bbox %}
+            Region {{ f.location.bbox }}
+            {% elif f.location.detail %}
+            {{ f.location.type }} ({{ f.location.detail }})
+            {% else %}
+            {{ f.location.type }}
+            {% endif %}
+          </td>
+          <td>{{ f.indicator }}</td>
+          <td><span class="badge badge-{{ f.confidence }}">{{ f.confidence }}</span></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p><em>No suspicious indicators were flagged across active analyzers.</em></p>
+    {% endif %}
+  </div>
+
+  <!-- Section 4: Visual Evidence -->
+  <div class="card">
+    <h2>4. Visual Evidence</h2>
+    {% if visual_evidence %}
+    <div class="image-grid">
+      {% for item in visual_evidence %}
+      <div class="image-card">
+        <img src="{{ item.data_uri }}" alt="{{ item.caption }}">
+        <div class="caption">{{ item.caption }}</div>
+      </div>
+      {% endfor %}
+    </div>
+    {% else %}
+    <p><em>No visual artifacts generated for this case.</em></p>
+    {% endif %}
+  </div>
+
+  <!-- Section 5: Cross-Modal Context -->
+  <div class="card">
+    <h2>5. Cross-Modal Context</h2>
+    {% set cross_findings = report.findings | selectattr("modality", "equalto", "cross_modal") | list %}
+    {% if cross_findings %}
+    <ul>
+      {% for cf in cross_findings %}
+      <li><strong>{{ cf.indicator }}:</strong> {{ cf.explanation }}</li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p><em>No cross-modal analysis in this version.</em></p>
+    {% endif %}
+  </div>
+
+  <!-- Section 6: Per-Finding Detail -->
+  <div class="card">
+    <h2>6. Per-Finding Detail</h2>
+    {% for f in report.findings %}
+    <div class="finding-block {{ f.status }}">
+      <p>
+        <strong>[{{ f.id }}] {{ f.analyzer }}</strong>
+        <span class="badge badge-{{ f.status }}">{{ f.status }}</span>
+        <span class="badge badge-{{ f.confidence }}">{{ f.confidence }}</span>
+      </p>
+      <p><strong>Indicator:</strong> {{ f.indicator }}</p>
+      <p><strong>Explanation:</strong> {{ f.explanation }}</p>
+      <p><strong>Limitations:</strong> <em>{{ f.limitations }}</em></p>
+    </div>
+    {% endfor %}
+  </div>
+
+  <!-- Section 7: Recommended Human Checks -->
+  <div class="card">
+    <h2>7. Recommended Human Checks</h2>
+    {% if report.recommended_human_checks %}
+    <ul>
+      {% for check in report.recommended_human_checks %}
+      <li>{{ check }}</li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p><em>Verify original evidence directly with the custodian or source.</em></p>
+    {% endif %}
+  </div>
+
+  <!-- Section 8: Analysis Log -->
+  <div class="card">
+    <h2>8. Analysis Log</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Timestamp</th>
+          <th>Step / Analyzer</th>
+          <th>File SHA-256</th>
+          <th>Result</th>
+          <th>Note</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for entry in report.analysis_log %}
+        <tr>
+          <td><small>{{ entry.time }}</small></td>
+          <td><code>{{ entry.step }}</code></td>
+          <td><code title="{{ entry.file }}">{{ entry.file[:12] }}...</code></td>
+          <td><span class="badge badge-{{ entry.result }}">{{ entry.result }}</span></td>
+          <td>{{ entry.note }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Section 9: Footer -->
+  <div class="footer">
+    Automated indicators only. Not a final verdict. Requires review by a human investigator.
+  </div>
+
+</div>
+</body>
+</html>

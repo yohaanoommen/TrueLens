@@ -1,4 +1,4 @@
-"""Tests for TruthLens schemas, validation, stubs, and pipeline.
+"""Tests for TruthLens schemas, validation, stubs, pipeline, confidence rules, and HTML reporting.
 
 Validates:
 (a) Empty or whitespace-only limitations and explanations are rejected.
@@ -7,16 +7,20 @@ Validates:
 (d) Image analyzer handles corrupt files, produces valid Findings, and integrates with pipeline.
 (e) ELA reporting cap, confidence calibration, and synthetic splice test.
 (f) Lossless PNG metadata and ELA caveat tests.
+(g) Stage 2b: Confidence rules (compute_overall) and self-contained HTML report generation.
 """
 
 from __future__ import annotations
 
+import base64
 from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
 from truthlens.analyzers import image as image_analyzer
+from truthlens.confidence import compute_overall, generate_recommended_checks
 from truthlens.pipeline import run_case
+from truthlens.report.generator import generate_html_report, save_html_report
 from truthlens.schemas import Finding, InputFile, Location, LogEntry, Overall, Report
 from truthlens.storage import sha256_file
 from truthlens.stubs import make_stub_findings
@@ -369,7 +373,6 @@ def test_png_without_exif_clear_not_flagged(tmp_path: Path):
     findings = image_analyzer.analyze(str(png_path), str(tmp_path))
     exif_findings = [f for f in findings if f.analyzer == "image.exif"]
 
-    # Must NOT have any flagged no-EXIF finding
     flagged_no_exif = [
         f
         for f in exif_findings
@@ -377,7 +380,6 @@ def test_png_without_exif_clear_not_flagged(tmp_path: Path):
     ]
     assert len(flagged_no_exif) == 0
 
-    # Must have a clear finding explaining camera EXIF is not normally present
     clear_exif = [f for f in exif_findings if f.status == "clear"]
     assert len(clear_exif) >= 1
     assert "not normally present" in clear_exif[0].explanation.lower()
@@ -447,3 +449,340 @@ def test_explanation_never_contains_empty_tag(tmp_path: Path):
         findings = image_analyzer.analyze(str(p), str(tmp_path))
         for f in findings:
             assert "Tag: ''" not in f.explanation
+
+
+# ---------------------------------------------------------------------------
+# (g) Stage 2b: Confidence Rules and HTML Report Generator
+# ---------------------------------------------------------------------------
+def test_confidence_ignores_stubs_and_unavailable():
+    """Findings starting with STUB. and status 'unavailable' are ignored in evidence counting."""
+    stub_finding = Finding(
+        id="f_stub",
+        modality="image",
+        analyzer="STUB.image",
+        indicator="Stub",
+        status="flagged",
+        confidence="low",
+        location=_make_dummy_location(),
+        explanation="Stub explanation.",
+        limitations="Stub limitation.",
+        evidence_refs=[],
+        source_file_sha256="abc",
+    )
+    overall = compute_overall([stub_finding])
+    assert overall.level == "inconclusive"
+    assert "No non-stub forensic evidence" in overall.summary
+
+    unavail_finding = Finding(
+        id="f_unavail",
+        modality="image",
+        analyzer="image.error",
+        indicator="Error",
+        status="unavailable",
+        confidence="low",
+        location=_make_dummy_location(),
+        explanation="Error explanation.",
+        limitations="Error limitation.",
+        evidence_refs=[],
+        source_file_sha256="abc",
+    )
+    overall_unavail = compute_overall([unavail_finding])
+    assert overall_unavail.level == "inconclusive"
+
+
+def test_confidence_multiple_findings_same_analyzer_counts_as_one_method():
+    """Multiple findings from the same analyzer (e.g. 3 ELA regions) count as ONE method (low level)."""
+    f1 = Finding(
+        id="f_ela_01",
+        modality="image",
+        analyzer="image.ela",
+        indicator="ELA",
+        status="flagged",
+        confidence="medium",
+        location=_make_dummy_location(),
+        explanation="Region 1.",
+        limitations="Limitation.",
+        evidence_refs=[],
+        source_file_sha256="abc",
+    )
+    f2 = Finding(
+        id="f_ela_02",
+        modality="image",
+        analyzer="image.ela",
+        indicator="ELA",
+        status="flagged",
+        confidence="medium",
+        location=_make_dummy_location(),
+        explanation="Region 2.",
+        limitations="Limitation.",
+        evidence_refs=[],
+        source_file_sha256="abc",
+    )
+    f3 = Finding(
+        id="f_ela_03",
+        modality="image",
+        analyzer="image.ela",
+        indicator="ELA",
+        status="flagged",
+        confidence="medium",
+        location=_make_dummy_location(),
+        explanation="Region 3.",
+        limitations="Limitation.",
+        evidence_refs=[],
+        source_file_sha256="abc",
+    )
+
+    overall = compute_overall([f1, f2, f3])
+    # Only 1 independent method -> must be "low", NOT "medium" or "high"
+    assert overall.level == "low"
+    assert len(overall.supporting_findings) == 3
+
+
+def test_confidence_two_independent_methods_reaches_medium():
+    """Two independent flagged methods (e.g. image.exif + image.ela) reach 'medium'."""
+    f_exif = Finding(
+        id="f_exif",
+        modality="image",
+        analyzer="image.exif",
+        indicator="Editing software",
+        status="flagged",
+        confidence="medium",
+        location=_make_dummy_location(),
+        explanation="Canva detected.",
+        limitations="Limitation.",
+        evidence_refs=[],
+        source_file_sha256="abc",
+    )
+    f_ela = Finding(
+        id="f_ela",
+        modality="image",
+        analyzer="image.ela",
+        indicator="ELA",
+        status="flagged",
+        confidence="medium",
+        location=_make_dummy_location(),
+        explanation="Region.",
+        limitations="Limitation.",
+        evidence_refs=[],
+        source_file_sha256="abc",
+    )
+
+    overall = compute_overall([f_exif, f_ela])
+    assert overall.level == "medium"
+    assert "2 independent forensic method(s)" in overall.reasoning
+
+
+def test_confidence_image_only_cannot_reach_high():
+    """Image-only evidence can never reach 'high' even with 3+ findings and 2 methods."""
+    f_exif = Finding(
+        id="f_exif",
+        modality="image",
+        analyzer="image.exif",
+        indicator="Editing software",
+        status="flagged",
+        confidence="high",
+        location=_make_dummy_location(),
+        explanation="Photoshop detected.",
+        limitations="Limitation.",
+        evidence_refs=[],
+        source_file_sha256="abc",
+    )
+    f_ela1 = Finding(
+        id="f_ela1",
+        modality="image",
+        analyzer="image.ela",
+        indicator="ELA",
+        status="flagged",
+        confidence="medium",
+        location=_make_dummy_location(),
+        explanation="Region 1.",
+        limitations="Limitation.",
+        evidence_refs=[],
+        source_file_sha256="abc",
+    )
+    f_ela2 = Finding(
+        id="f_ela2",
+        modality="image",
+        analyzer="image.ela",
+        indicator="ELA",
+        status="flagged",
+        confidence="medium",
+        location=_make_dummy_location(),
+        explanation="Region 2.",
+        limitations="Limitation.",
+        evidence_refs=[],
+        source_file_sha256="abc",
+    )
+
+    overall = compute_overall([f_exif, f_ela1, f_ela2])
+    # Capped below 'high' because all modalities are 'image'
+    assert overall.level == "medium"
+    assert "Image-only evidence is capped below 'high'" in overall.reasoning
+
+
+def test_confidence_multi_modal_can_reach_high():
+    """3+ flagged findings from >= 2 methods AND multi-modal agreement reaches 'high'."""
+    f_exif = Finding(
+        id="f_exif",
+        modality="image",
+        analyzer="image.exif",
+        indicator="Editing software",
+        status="flagged",
+        confidence="medium",
+        location=_make_dummy_location(),
+        explanation="Photoshop.",
+        limitations="Limitation.",
+        evidence_refs=[],
+        source_file_sha256="abc",
+    )
+    f_ela = Finding(
+        id="f_ela",
+        modality="image",
+        analyzer="image.ela",
+        indicator="ELA",
+        status="flagged",
+        confidence="medium",
+        location=_make_dummy_location(),
+        explanation="Region.",
+        limitations="Limitation.",
+        evidence_refs=[],
+        source_file_sha256="abc",
+    )
+    f_audio = Finding(
+        id="f_audio",
+        modality="audio",
+        analyzer="audio.synthetic_speech",
+        indicator="Synthetic voice detected",
+        status="flagged",
+        confidence="medium",
+        location=_make_dummy_location(),
+        explanation="Synthetic voice markers.",
+        limitations="Limitation.",
+        evidence_refs=[],
+        source_file_sha256="def",
+    )
+
+    overall = compute_overall([f_exif, f_ela, f_audio])
+    assert overall.level == "high"
+
+
+def test_confidence_reasoning_and_caveats():
+    """Reasoning specifies why chosen and what would change it; caveats state rule-based."""
+    f = Finding(
+        id="f_exif",
+        modality="image",
+        analyzer="image.exif",
+        indicator="Editing software",
+        status="flagged",
+        confidence="medium",
+        location=_make_dummy_location(),
+        explanation="Photoshop.",
+        limitations="Limitation.",
+        evidence_refs=[],
+        source_file_sha256="abc",
+    )
+    overall = compute_overall([f])
+    assert "why" in overall.reasoning.lower() or "was assigned" in overall.reasoning.lower()
+    assert "change" in overall.reasoning.lower() or "elevate" in overall.reasoning.lower()
+    assert any("rule-based" in c.lower() for c in overall.caveats)
+    assert any("statistically calibrated" in c.lower() for c in overall.caveats)
+
+
+def test_dynamic_human_checks_generation():
+    """Checks are generated dynamically from actual findings."""
+    f1 = Finding(
+        id="f_exif_missing",
+        modality="image",
+        analyzer="image.exif",
+        indicator="Missing EXIF metadata",
+        status="flagged",
+        confidence="low",
+        location=_make_dummy_location(),
+        explanation="Missing EXIF.",
+        limitations="Limitation.",
+        evidence_refs=[],
+        source_file_sha256="abc",
+    )
+    checks = generate_recommended_checks([f1])
+    assert any("original" in c.lower() for c in checks)
+
+
+def test_html_report_generation(tmp_path: Path):
+    """Test self-contained HTML report generation with base64 embedded images."""
+    from PIL import Image
+
+    # 1. Create a dummy artifact image in tmp_path/artifacts/test_ela.png
+    artifacts_dir = tmp_path / "artifacts"
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    art_path = artifacts_dir / "test_ela.png"
+    Image.new("RGB", (64, 64), color=(255, 0, 0)).save(art_path, format="PNG")
+
+    # 2. Build Report
+    f = Finding(
+        id="f_test_01",
+        modality="image",
+        analyzer="image.ela",
+        indicator="Inconsistent compression",
+        status="flagged",
+        confidence="medium",
+        raw_score=0.72,
+        location=Location(type="region", bbox=[10, 10, 20, 20]),
+        explanation="Test explanation.",
+        limitations="Test limitations.",
+        evidence_refs=["artifacts/test_ela.png"],
+        source_file_sha256="1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+    )
+    overall = Overall(
+        level="medium",
+        summary="Test summary.",
+        reasoning="Test reasoning.",
+        supporting_findings=["f_test_01"],
+        caveats=["Test caveat."],
+    )
+    report = Report(
+        case_id="c_test_case_999",
+        inputs=[
+            InputFile(
+                file_id="inp_01",
+                filename="evidence.jpg",
+                media_type="image",
+                sha256="1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+                size_bytes=54321,
+            )
+        ],
+        context={"caption": "Test claim"},
+        findings=[f],
+        overall=overall,
+        recommended_human_checks=["Check source authenticity."],
+        analysis_log=[
+            LogEntry(
+                time="2026-11-19T10:00:00Z",
+                step="image.ela",
+                file="1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+                result="ok",
+                note="Completed ok",
+            )
+        ],
+    )
+
+    # 3. Generate HTML
+    html_output = generate_html_report(report, tmp_path)
+    assert isinstance(html_output, str)
+    assert "TruthLens Forensic Report" in html_output
+    assert "c_test_case_999" in html_output
+    assert "2. Overall Assessment" in html_output
+    assert "3. Flagged Evidence Table" in html_output
+    assert "4. Visual Evidence" in html_output
+    assert "5. Cross-Modal Context" in html_output
+    assert "6. Per-Finding Detail" in html_output
+    assert "7. Recommended Human Checks" in html_output
+    assert "8. Analysis Log" in html_output
+    assert "Automated indicators only. Not a final verdict. Requires review by a human investigator." in html_output
+
+    # Check base64 embedding
+    assert "data:image/png;base64," in html_output
+
+    # Test saving HTML report
+    out_file = save_html_report(report, tmp_path)
+    assert out_file.exists()
+    assert out_file.stat().st_size > 500
