@@ -1,10 +1,9 @@
-"""Pipeline orchestration for Stage 1.
+"""Pipeline orchestration for TruthLens.
 
 The ``run_case`` function receives a list of uploaded file paths and an optional
-context dictionary (e.g. a caption). It stores the originals, creates a stub
-report using the placeholder findings from ``stubs.py`` and returns a ``Report``
-model instance. The function also writes the JSON representation of the report
-to ``data/cases/<case_id>/report.json`` so the UI can offer a download.
+context dictionary (e.g. a caption). It stores the originals, runs real analyzers
+for supported modalities (image), and stub findings for other modalities.
+Writes the JSON representation to ``data/cases/<case_id>/report.json``.
 """
 
 from __future__ import annotations
@@ -13,8 +12,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Mapping
 
+from .analyzers import image as image_analyzer
 from .schemas import Finding, InputFile, LogEntry, Overall, Report
-from .storage import detect_media_type, save_originals
+from .storage import DATA_ROOT, detect_media_type, save_originals
 from .stubs import make_stub_findings
 
 
@@ -22,19 +22,41 @@ def _build_overall(findings: List[Finding]) -> Overall:
     """Create a minimal ``Overall`` assessment."""
     flagged = [f.id for f in findings if f.status == "flagged"]
     has_unavailable = any(f.status == "unavailable" for f in findings)
+    has_stubs = any(f.analyzer.startswith("STUB.") for f in findings)
 
     if findings and all(f.status == "unavailable" for f in findings):
         level = "inconclusive"
         summary = "Analysis unavailable for all uploaded files."
         reasoning = "All inputs have unsupported formats or could not be processed."
+    elif flagged:
+        high_conf = any(
+            f.confidence == "high" for f in findings if f.status == "flagged"
+        )
+        med_conf = [
+            f
+            for f in findings
+            if f.status == "flagged" and f.confidence == "medium"
+        ]
+        if high_conf or len(med_conf) >= 2:
+            level = "medium"
+        else:
+            level = "low"
+        summary = f"{len(flagged)} indicator(s) flagged during analysis."
+        reasoning = "Flagged indicators warrant human review and correlation with source context."
     else:
         level = "low"
-        summary = "Stub analysis – no real detection performed."
-        reasoning = "Findings are placeholders generated for UI development."
+        summary = "No anomalous indicators flagged."
+        reasoning = "Analyzers completed with clear results."
 
-    caveats = ["The current pipeline contains only stub findings."]
+    caveats = []
+    if has_stubs:
+        caveats.append("Some modalities used stub analyzers.")
     if has_unavailable:
-        caveats.append("One or more files had unsupported formats.")
+        caveats.append("One or more files or analyzer steps were unavailable.")
+    if not caveats:
+        caveats.append(
+            "Automated forensic signals only; human verification required."
+        )
 
     return Overall(
         level=level,
@@ -55,7 +77,11 @@ def _build_log(findings: List[Finding]) -> List[LogEntry]:
                 step=f.analyzer,
                 file=f.source_file_sha256,
                 result="unavailable" if f.status == "unavailable" else "ok",
-                note=f.limitations if f.status == "unavailable" else "stub finding",
+                note=(
+                    f.limitations
+                    if f.status == "unavailable"
+                    else f"{f.status}: {f.indicator}"
+                ),
             )
         )
     return log
@@ -77,9 +103,20 @@ def run_case(file_paths: List[Path], context: Mapping | None = None) -> Report:
 
     # Store originals and obtain InputFile metadata.
     case_id, inputs = save_originals(file_paths)
+    case_dir = DATA_ROOT / case_id
 
-    # Generate stub findings per stored file.
-    findings = make_stub_findings(inputs)
+    findings: List[Finding] = []
+    for inp in inputs:
+        if inp.media_type == "image":
+            orig_file_path = case_dir / "originals" / inp.filename
+            img_findings = image_analyzer.analyze(
+                str(orig_file_path), str(case_dir), dict(context)
+            )
+            findings.extend(img_findings)
+        else:
+            # Keep stub findings for other media types (video, audio, text, unknown)
+            stub_list = make_stub_findings([inp])
+            findings.extend(stub_list)
 
     overall = _build_overall(findings)
     analysis_log = _build_log(findings)
@@ -90,14 +127,15 @@ def run_case(file_paths: List[Path], context: Mapping | None = None) -> Report:
         context=dict(context),
         findings=findings,
         overall=overall,
-        recommended_human_checks=["Verify file authenticity manually."],
+        recommended_human_checks=[
+            "Verify the original source and chain of custody.",
+            "Cross-reference findings across available modalities.",
+        ],
         analysis_log=analysis_log,
     )
 
     # Persist the JSON report.
-    report_path = (
-        Path(__file__).resolve().parent.parent / "data" / "cases" / case_id / "report.json"
-    )
+    report_path = case_dir / "report.json"
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(report.model_dump_json(indent=2))
     return report

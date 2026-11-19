@@ -4,6 +4,9 @@ Validates:
 (a) Empty or whitespace-only limitations and explanations are rejected.
 (b) Stub findings carry the real sha256 and matching modality.
 (c) Unknown file extensions produce an 'unavailable' finding with the reason.
+(d) Image analyzer handles corrupt files, produces valid Findings, and integrates with pipeline.
+(e) ELA reporting cap, confidence calibration, and synthetic splice test.
+(f) Lossless PNG metadata and ELA caveat tests.
 """
 
 from __future__ import annotations
@@ -12,6 +15,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from truthlens.analyzers import image as image_analyzer
 from truthlens.pipeline import run_case
 from truthlens.schemas import Finding, InputFile, Location, LogEntry, Overall, Report
 from truthlens.storage import sha256_file
@@ -196,5 +200,250 @@ def test_report_created_at_timezone_aware():
         recommended_human_checks=[],
         analysis_log=[],
     )
-    # Timezone-aware ISO string should end with +00:00 or Z
     assert "+00:00" in report.created_at or report.created_at.endswith("Z")
+
+
+# ---------------------------------------------------------------------------
+# (d) Stage 2a: Image Analyzer Tests
+# ---------------------------------------------------------------------------
+def test_image_analyzer_corrupted_file(tmp_path: Path):
+    corrupt_file = tmp_path / "corrupt.jpg"
+    corrupt_file.write_bytes(b"\x00\xff\xfe\x01\x02\x03\x04\x05not_a_valid_image_stream")
+
+    findings = image_analyzer.analyze(str(corrupt_file), str(tmp_path))
+    assert len(findings) >= 1
+    for f in findings:
+        assert isinstance(f, Finding)
+        assert f.status == "unavailable"
+        assert len(f.limitations.strip()) > 0
+        assert f.modality == "image"
+
+
+def test_image_analyzer_nonexistent_file(tmp_path: Path):
+    missing_path = tmp_path / "nonexistent.png"
+    findings = image_analyzer.analyze(str(missing_path), str(tmp_path))
+    assert len(findings) == 1
+    f = findings[0]
+    assert isinstance(f, Finding)
+    assert f.status == "unavailable"
+    assert "nonexistent.png" in f.explanation
+    assert len(f.limitations.strip()) > 0
+
+
+def test_image_analyzer_sample_images(tmp_path: Path):
+    repo_root = Path(__file__).resolve().parent.parent
+    sample1 = repo_root / "samples" / "image1.jpeg"
+    sample2 = repo_root / "samples" / "image2.jpg"
+
+    if not sample1.exists() or not sample2.exists():
+        pytest.skip("Sample images not found in samples/ directory")
+
+    # Analyze sample1 (manipulated image without EXIF)
+    findings1 = image_analyzer.analyze(str(sample1), str(tmp_path))
+    assert len(findings1) >= 2
+    for f in findings1:
+        assert isinstance(f, Finding)
+        assert len(f.explanation.strip()) > 0
+        assert len(f.limitations.strip()) > 0
+        assert f.modality == "image"
+        assert f.analyzer in ("image.exif", "image.ela")
+        for ref in f.evidence_refs:
+            assert (tmp_path / ref).exists()
+
+    # Verify sample1 flagged indicators
+    analyzers1 = [f.analyzer for f in findings1]
+    assert "image.exif" in analyzers1
+    assert "image.ela" in analyzers1
+    exif_findings1 = [f for f in findings1 if f.analyzer == "image.exif"]
+    assert any(f.status == "flagged" for f in exif_findings1)
+
+    # Analyze sample2 (normal image with EXIF)
+    findings2 = image_analyzer.analyze(str(sample2), str(tmp_path))
+    assert len(findings2) >= 2
+    for f in findings2:
+        assert isinstance(f, Finding)
+        assert len(f.explanation.strip()) > 0
+        assert len(f.limitations.strip()) > 0
+        for ref in f.evidence_refs:
+            assert (tmp_path / ref).exists()
+
+    exif_findings2 = [f for f in findings2 if f.analyzer == "image.exif"]
+    assert any(f.status == "clear" for f in exif_findings2)
+
+
+def test_pipeline_with_real_image():
+    repo_root = Path(__file__).resolve().parent.parent
+    sample1 = repo_root / "samples" / "image1.jpeg"
+    if not sample1.exists():
+        pytest.skip("Sample image1 not found")
+
+    report = run_case([sample1], {"caption": "Test real image run"})
+    assert isinstance(report, Report)
+    assert len(report.inputs) == 1
+    assert report.inputs[0].media_type == "image"
+    assert len(report.findings) >= 2
+    assert any(f.analyzer == "image.ela" for f in report.findings)
+    assert not any(f.analyzer.startswith("STUB.") for f in report.findings)
+    log_steps = [entry.step for entry in report.analysis_log]
+    assert "image.ela" in log_steps
+
+
+# ---------------------------------------------------------------------------
+# (e) ELA reporting cap, confidence calibration, and synthetic splice test
+# ---------------------------------------------------------------------------
+def test_ela_max_three_regions_reporting(tmp_path: Path):
+    repo_root = Path(__file__).resolve().parent.parent
+    sample1 = repo_root / "samples" / "image1.jpeg"
+    if not sample1.exists():
+        pytest.skip("Sample image1 not found")
+
+    findings = image_analyzer.analyze(str(sample1), str(tmp_path))
+    ela_findings = [f for f in findings if f.analyzer == "image.ela"]
+    assert len(ela_findings) <= 3
+    if len(ela_findings) > 0:
+        first_ela = ela_findings[0]
+        assert "showing the 3 strongest" in first_ela.explanation
+        assert first_ela.confidence == "low"
+        assert "Widespread differences more likely reflect recompression" in first_ela.explanation
+
+
+def test_synthetic_spliced_image_ela(tmp_path: Path):
+    """Build a synthetic spliced image in code and test whether ELA flags the pasted region."""
+    import io
+    import numpy as np
+    from PIL import Image
+
+    # 1. Smooth background saved as JPEG at quality 95
+    bg = Image.new("RGB", (400, 400), color=(180, 200, 220))
+    buf = io.BytesIO()
+    bg.save(buf, format="JPEG", quality=95)
+    buf.seek(0)
+    img = Image.open(buf).convert("RGB")
+
+    # 2. Textured patch saved at quality 60
+    patch_arr = np.random.RandomState(42).randint(0, 255, (100, 100, 3), dtype=np.uint8)
+    patch = Image.fromarray(patch_arr)
+    p_buf = io.BytesIO()
+    patch.save(p_buf, format="JPEG", quality=60)
+    p_buf.seek(0)
+    patch_jpg = Image.open(p_buf).convert("RGB")
+
+    # 3. Paste patch at (100, 100)
+    img.paste(patch_jpg, (100, 100))
+
+    # 4. Re-save spliced image as JPEG at quality 85
+    spliced_file = tmp_path / "spliced.jpg"
+    img.save(spliced_file, format="JPEG", quality=85)
+
+    # 5. Run image analyzer
+    findings = image_analyzer.analyze(str(spliced_file), str(tmp_path))
+    ela_findings = [f for f in findings if f.analyzer == "image.ela"]
+
+    flagged_bboxes = [
+        f.location.bbox for f in ela_findings if f.status == "flagged" and f.location.bbox
+    ]
+    pasted_box = [100, 100, 100, 100]
+
+    is_flagged = False
+    for bx, by, bw, bh in flagged_bboxes:
+        overlap_x = max(0, min(bx + bw, 200) - max(bx, 100))
+        overlap_y = max(0, min(by + bh, 200) - max(by, 100))
+        if overlap_x > 0 and overlap_y > 0:
+            is_flagged = True
+            break
+
+    assert is_flagged, f"Expected spliced patch at {pasted_box} to be flagged by ELA, got bboxes: {flagged_bboxes}"
+
+
+# ---------------------------------------------------------------------------
+# (f) Lossless PNG metadata and ELA caveat tests
+# ---------------------------------------------------------------------------
+def test_png_without_exif_clear_not_flagged(tmp_path: Path):
+    """(a) A PNG with no EXIF does not produce a 'flagged' no-EXIF finding."""
+    from PIL import Image
+
+    png_path = tmp_path / "clean.png"
+    img = Image.new("RGB", (100, 100), color=(120, 150, 180))
+    img.save(png_path, format="PNG")
+
+    findings = image_analyzer.analyze(str(png_path), str(tmp_path))
+    exif_findings = [f for f in findings if f.analyzer == "image.exif"]
+
+    # Must NOT have any flagged no-EXIF finding
+    flagged_no_exif = [
+        f
+        for f in exif_findings
+        if f.status == "flagged" and "missing" in f.indicator.lower()
+    ]
+    assert len(flagged_no_exif) == 0
+
+    # Must have a clear finding explaining camera EXIF is not normally present
+    clear_exif = [f for f in exif_findings if f.status == "clear"]
+    assert len(clear_exif) >= 1
+    assert "not normally present" in clear_exif[0].explanation.lower()
+    assert "absent, stripped, or forged" in clear_exif[0].limitations.lower()
+
+
+def test_png_with_canva_text_chunk_flagged(tmp_path: Path):
+    """(b) A PNG with a Canva Software text chunk is still flagged."""
+    from PIL import Image
+    from PIL.PngImagePlugin import PngInfo
+
+    png_path = tmp_path / "canva.png"
+    img = Image.new("RGB", (100, 100), color=(120, 150, 180))
+    png_info = PngInfo()
+    png_info.add_text("Software", "Canva")
+    img.save(png_path, format="PNG", pnginfo=png_info)
+
+    findings = image_analyzer.analyze(str(png_path), str(tmp_path))
+    flagged_software = [
+        f
+        for f in findings
+        if f.analyzer == "image.exif"
+        and f.status == "flagged"
+        and "editing software" in f.indicator.lower()
+    ]
+    assert len(flagged_software) >= 1
+    assert "canva" in flagged_software[0].explanation.lower()
+
+
+def test_png_ela_limitations_contain_jpeg_caveat(tmp_path: Path):
+    """(c) The ELA limitations for a PNG contain the new JPEG-design caveat."""
+    from PIL import Image
+
+    png_path = tmp_path / "test_ela.png"
+    img = Image.new("RGB", (100, 100), color=(120, 150, 180))
+    img.save(png_path, format="PNG")
+
+    findings = image_analyzer.analyze(str(png_path), str(tmp_path))
+    ela_findings = [f for f in findings if f.analyzer == "image.ela"]
+    assert len(ela_findings) >= 1
+
+    expected_caveat = (
+        "ELA is designed for JPEG. On lossless images the result mainly reflects "
+        "differences in texture and prior compression history, so treat it as a pointer "
+        "for human review, not as evidence of editing."
+    )
+    for f in ela_findings:
+        assert expected_caveat in f.limitations
+
+
+def test_explanation_never_contains_empty_tag(tmp_path: Path):
+    """(d) The explanation text never contains 'Tag: '''."""
+    repo_root = Path(__file__).resolve().parent.parent
+    sample3 = repo_root / "samples" / "image3.png"
+
+    test_paths = [sample3] if sample3.exists() else []
+
+    from PIL import Image
+
+    xmp_png = tmp_path / "xmp_canva.png"
+    img = Image.new("RGB", (100, 100), color=(100, 100, 100))
+    img.info["xmp"] = b"<xmp:CreatorTool>Canva</xmp:CreatorTool>"
+    img.save(xmp_png, format="PNG")
+    test_paths.append(xmp_png)
+
+    for p in test_paths:
+        findings = image_analyzer.analyze(str(p), str(tmp_path))
+        for f in findings:
+            assert "Tag: ''" not in f.explanation

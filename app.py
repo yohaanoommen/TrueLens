@@ -1,9 +1,8 @@
-"""Streamlit UI for TruthLens Stage 1.
+"""Streamlit UI for TruthLens.
 
 The UI allows the user to upload one or more files, optionally provide a caption,
-and then run the ``run_case`` pipeline which currently returns stub findings.
-The resulting findings are displayed with their ``limitations`` and a JSON
-report can be downloaded.
+and runs the TruthLens analysis pipeline.
+Displays findings, limitations, and evidence images.
 """
 
 from __future__ import annotations
@@ -17,9 +16,9 @@ import streamlit as st
 from truthlens.pipeline import run_case
 from truthlens.schemas import Finding, Report
 
-st.set_page_config(page_title="TruthLens – Stage 1", layout="centered")
+st.set_page_config(page_title="TruthLens – Digital Forensics", layout="centered")
 
-st.title("TruthLens – Stage 1 (Skeleton)")
+st.title("TruthLens – Multimodal Digital Forensics")
 
 uploaded_files = st.file_uploader(
     "Upload evidence files (images, video, audio, text)",
@@ -53,9 +52,16 @@ if st.button("Analyze"):
         if any(f.analyzer.startswith("STUB.") for f in report.findings):
             st.warning("Demo mode: these are placeholder findings, not real analysis.")
 
+        # Overall summary card
+        st.subheader("Overall Assessment")
+        st.markdown(f"**Confidence Level:** `{report.overall.level.upper()}`")
+        st.markdown(f"**Summary:** {report.overall.summary}")
+        st.markdown(f"**Reasoning:** {report.overall.reasoning}")
+
         # Display findings.
         st.subheader("Findings")
         if report.findings:
+            case_dir = Path("data") / "cases" / report.case_id
             for f in report.findings:
                 status_label = (
                     f" [{f.status.upper()}]" if f.status == "unavailable" else ""
@@ -66,9 +72,22 @@ if st.button("Analyze"):
                 with expander:
                     st.write(f"**Analyzer:** `{f.analyzer}`")
                     st.write(f"**Confidence:** {f.confidence}")
+                    if f.raw_score is not None:
+                        st.write(f"**Raw Score:** {f.raw_score}")
                     st.write(f"**Explanation:** {f.explanation}")
                     st.write(f"**Limitations:** {f.limitations}")
                     st.write(f"**Source SHA256:** `{f.source_file_sha256}`")
+                    if f.location.bbox:
+                        st.write(f"**Flagged Region (bbox):** `{f.location.bbox}`")
+                    if f.evidence_refs:
+                        for ref in f.evidence_refs:
+                            evidence_path = case_dir / ref
+                            if evidence_path.exists():
+                                st.image(
+                                    str(evidence_path),
+                                    caption=f"Evidence: {ref}",
+                                    use_container_width=True,
+                                )
         else:
             st.info("No findings were generated.")
 
